@@ -1,53 +1,49 @@
-/*
- * Eberwein Backend AS5600
- * Copyright (c) 2025 Embedded Solutions GmbH <office@embedded-solutions.at>
- * Authors: Roland Lezuo <roland.lezuo@embedded-solutions.at>
- * All rights reserved.
- */
-
-
-/* ABOUT THIS FILE *********************************************************
- *
- * this file is part of the QTDemo application (not shipped in source)
- * and demonstrates usage and parsing of the HID events
- *
- * please carefully read the comments in this file to understand the HID events
- */
+/* ABOUT THIS FILE: plain C++ USB HID handler (no Qt). */
 
 #include "usbhidhandler.h"
 #include "hid_structs.h"
 
-#include <qthread.h>
+#include <thread>
+#include <chrono>
 #include <cstring>
+#include <cstdio>
+#include <cstdlib>
 
-#if defined(linux)
+#if defined(__linux__) || defined(linux)
 #include <hidapi/hidapi.h>
 #include <endian.h>
 #else
-// this is win64
+// Windows
 #include <hidapi.h>
 #include <winsock.h>
 #define be16toh ntohs
 #endif
 
 #include <cstddef>
-#include <QDebug>
 
-/* this include contains a number of macro definitions and also some comments about the HID structs
- * not all HID reports defined in hid_structs.h are publicly documented
- */
-#include <hid_structs.h>
+#include <locale>
+#include <cwchar>
+#include <vector>
+
 #define USB_VID 0x0000
 #define USB_PID 0x0002
 
-USBHIDHandler::USBHIDHandler(QObject *parent, bool boardNo)
-    : QObject{parent}, QRunnable()
+static std::string wstr_to_utf8(const wchar_t *wstr) {
+    if (!wstr) return std::string();
+    std::size_t len = std::wcslen(wstr);
+    if (len == 0) return std::string();
+    std::vector<char> buf((len + 1) * 4);
+    std::size_t out = std::wcstombs(buf.data(), wstr, buf.size());
+    if (out == static_cast<std::size_t>(-1)) {
+        return std::string();
+    }
+    return std::string(buf.data());
+}
+
+USBHIDHandler::USBHIDHandler(bool boardNo)
+: run_(false), h_(nullptr), boardNo_(boardNo)
 {
-    run_ = true;
-    qRegisterMetaType<USBHIDHandler::USBHIDHandlerState>("USBHIDHandler::USBHIDHandlerState");
-
     int res = hid_init();
-
     if (res == -1) {
         printf("hid_init failed\n");
         throw std::string("failed to init hid library");
@@ -58,29 +54,29 @@ USBHIDHandler::USBHIDHandler(QObject *parent, bool boardNo)
     wchar_t serialo[17]= L"4146500700320003";
     wchar_t serialot[17] = L"41465007003A0003";
 
-
-
-
-    //serialNo.toWCharArray(serialto);
-
-    //L before "" indicates the string to be in unicode
-
-
-    //qDebug() << "serialNo:" << serialNo;
-    //qDebug() << "serialo:" << serialo;
-    //qDebug() << "serialto" << serialto;
-
-    if(boardNo)
-    h_ = hid_open(HID_USB_VID, HID_USB_PID, serialo);
+    if (boardNo_)
+        h_ = hid_open(HID_USB_VID, HID_USB_PID, serialo);
     else
         h_ = hid_open(HID_USB_VID, HID_USB_PID, serialot);
-    if (h_ != NULL)
-    {
+
+    if (h_ != NULL) {
         wchar_t serial[200];
         hid_get_serial_number_string((hid_device *)h_, serial, 200);
-
-        serial_ = QString::fromWCharArray(serial);
+        serial_ = wstr_to_utf8(serial);
     }
+}
+
+USBHIDHandler::~USBHIDHandler()
+{
+    terminate();
+    if (worker_.joinable()) worker_.join();
+    if (h_) hid_close((hid_device*)h_);
+}
+
+void USBHIDHandler::start()
+{
+    run_ = true;
+    worker_ = std::thread(&USBHIDHandler::run, this);
 }
 
 void USBHIDHandler::terminate()
@@ -97,68 +93,50 @@ bool USBHIDHandler::setDialPositions( unsigned mux_setting, unsigned dial_nr,cha
     printf("configuration dial position for dial %i with %i steps and offset %f\n", dial_nr, nr_positions, zero_offset);
     uint16_t zo = zero_offset / 360.0 * HID_INPUT_NR_RAW_VALUE;
 
-    mode = 0;                       //Not implemented yet to force to be 0
+    mode = 0;
     struct hid_feature_1_report fr;
     fr.id = HID_FEATURE_ID_1;
     fr.mux_setting = mux_setting;
     fr.dial_id = dial_nr;
-    fr.mode = mode; //to_mode(dial_nr, mode); right now make 0
+    fr.mode = mode;
     fr.nr_dial_pos = nr_positions;
     fr.raw_zero_offset = htobe16(zo);
-    //fr.raw_zero_offset = htobe16(0x4000 /*hyst-setting*/ | (zero_offset & HID_INPUT_RAW_MASK));
     fr.mag_pressed_threshold = htobe16(mag_pressed_threshold);
 
-    int r = hid_send_feature_report(h, (const unsigned char*)&fr, sizeof(fr));
+    int r = hid_send_feature_report((hid_device*)h, (const unsigned char*)&fr, sizeof(fr));
 
     return (r == sizeof(fr));
 }
 
 void USBHIDHandler::run()
 {
-
-    while (true) {        
+    while (true) {
         for (;;) {
             if (!run_ || !h_) break;
 
-            /* retrieve next HID event */
             uint8_t buffer[HID_USB_MAX_REPORT_SZ];
             int res = hid_read((hid_device*)h_, buffer, sizeof(buffer));
 
             if (res == -1) {
-                perror("failed to read from device\n");
+                perror("failed to read from device");
                 break;
+            } else if (res == 0) {
+                continue;
             } else {
                 switch (buffer[0]) {
-                    /* this is the primary report, containing position of the dials and information on button press events and
-                   and directionial information */
-                case HID_REPORT_ID_1:
-                {
+                case HID_REPORT_ID_1: {
                     struct hid_input_report *hi = (struct hid_input_report *)buffer;
                     uint16_t rab = be16toh(hi->raw_and_button);
-
-                    /* raw holds positional information of dial */
                     uint16_t raw = rab & HID_INPUT_RAW_MASK;
-                    /* this bit is true if the button is pressed, false otherwise */
                     bool button_pressed = rab & HID_INPUT_BUTTON_MASK;
-                    /* this bit is true if the dial's raw value has changed and increased its value (handles wrap-arount at when change from max -> 0) */
                     bool moved_pos = ((rab & HID_INPUT_DIRECTION_MASK) >> HID_INPUT_DIRECTION_SHIFT) & HID_INPUT_DIRECTION_POS;
-                    /* this bit is true if the dial's raw value has changed and decreased its value (handles wrap-arount at when change from 0 -> max) */
                     bool moved_neg = ((rab & HID_INPUT_DIRECTION_MASK) >> HID_INPUT_DIRECTION_SHIFT) & HID_INPUT_DIRECTION_NEG;
-                    /* dial_id is the user-visible number for the button */
                     int dial_nr = hi->dial_id;
-                    /* nr_pos contains the number of position the dial will "click into", actual value reported are 0 <= x < nr_dial_pos */
                     uint8_t nr_pos = hi->nr_dial_pos;
 
                     printf("got change report for dial %i to position %i\n", dial_nr, raw);
-                    float val;
 
-                    if (nr_pos == 0) {
-                        val = 360.0 * ((float)raw / HID_INPUT_NR_RAW_VALUE);
-                    } else {
-                        val = raw;
-                    }
-                    emit dialChanged(dial_nr, val, nr_pos,
-                                     button_pressed, moved_pos, moved_neg);
+                    if (onDialChanged) onDialChanged((unsigned)dial_nr, (unsigned)raw, (unsigned)nr_pos, button_pressed, moved_pos, moved_neg);
                     break;
                 }
                 default:
@@ -166,42 +144,37 @@ void USBHIDHandler::run()
                     break;
                 }
             }
-
         }
-        // try to re-open device
+
         if (h_ != NULL) hid_close((hid_device*)h_);
-        emit stateChanged(USBHIDHandlerState::STATE_DISCONNECT);
+        if (onStateChanged) onStateChanged(USBHIDHandlerState::STATE_DISCONNECT);
 
         printf("opening hidraw device\n");
-        /* connect to the device using the given vendor and product IDs */
         h_ = hid_open(HID_USB_VID, HID_USB_PID, NULL);
 
         if (h_ == NULL) {
             perror("could not open a device");
-            emit stateChanged(USBHIDHandlerState::STATE_DISCONNECT);
+            if (onStateChanged) onStateChanged(USBHIDHandlerState::STATE_DISCONNECT);
         } else {
             wchar_t serial[200];
-
-            /* retrieve serial number from HID descriptor, this is provided by usbhid library and needed */
             hid_get_serial_number_string((hid_device*)h_, serial, 200);
-            serial_ = QString::fromWCharArray(serial);
+            serial_ = wstr_to_utf8(serial);
 
-            /* retrieve device's firmware version string, leave place for \0 */
             uint8_t fw_version[HID_FIRMWARE_STRING_SZ+1];
-
             fw_version[0] = HID_FEATURE_ID_3;
             int r = hid_get_feature_report((hid_device*)h_, fw_version, sizeof(fw_version));
             fw_version[25] = 0;
 
             if (r) {
-                serial_ += QString("@%1").arg((const char*)(&fw_version[1]));
+                serial_ += "@";
+                serial_ += reinterpret_cast<char*>(&fw_version[1]);
             }
 
-            emit stateChanged(USBHIDHandlerState::STATE_CONNECTED);
+            if (onStateChanged) onStateChanged(USBHIDHandlerState::STATE_CONNECTED);
         }
 
         if (!run_) break;
-        QThread::sleep(1);
+        std::this_thread::sleep_for(std::chrono::seconds(1));
     }
 
     printf("terminating usb-hid loop\n");
