@@ -1,5 +1,3 @@
-/* ABOUT THIS FILE: plain C++ USB HID handler (no Qt). */
-
 #include "usbhidhandler.h"
 #include "hid_structs.h"
 
@@ -12,11 +10,6 @@
 #if defined(__linux__) || defined(linux)
 #include <hidapi/hidapi.h>
 #include <endian.h>
-#else
-// Windows
-#include <hidapi.h>
-#include <winsock.h>
-#define be16toh ntohs
 #endif
 
 #include <cstddef>
@@ -40,37 +33,24 @@ static std::string wstr_to_utf8(const wchar_t *wstr) {
     return std::string(buf.data());
 }
 
-USBHIDHandler::USBHIDHandler(bool boardNo)
-: run_(false), h_(nullptr), boardNo_(boardNo)
+USBHIDHandler::USBHIDHandler()
+: run_(false), h_(nullptr)
 {
     int res = hid_init();
     if (res == -1) {
         printf("hid_init failed\n");
         throw std::string("failed to init hid library");
     }
-
+    
     printf("initially opening hidraw device\n");
-
-    wchar_t serialo[17]= L"4146500700320003";
-    wchar_t serialot[17] = L"41465007003A0003";
-
-    if (boardNo_)
-        h_ = hid_open(HID_USB_VID, HID_USB_PID, serialo);
-    else
-        h_ = hid_open(HID_USB_VID, HID_USB_PID, serialot);
-
-    if (h_ != NULL) {
-        wchar_t serial[200];
-        hid_get_serial_number_string((hid_device *)h_, serial, 200);
-        serial_ = wstr_to_utf8(serial);
-    }
+    openDevice();
 }
 
 USBHIDHandler::~USBHIDHandler()
 {
     terminate();
     if (worker_.joinable()) worker_.join();
-    if (h_) hid_close((hid_device*)h_);
+    if (h_ != NULL) {hid_close((hid_device*)h_); h_ = NULL;}
 }
 
 void USBHIDHandler::start()
@@ -134,8 +114,6 @@ void USBHIDHandler::run()
                     int dial_nr = hi->dial_id;
                     uint8_t nr_pos = hi->nr_dial_pos;
 
-                    printf("got change report for dial %i to position %i\n", dial_nr, raw);
-
                     if (onDialChanged) onDialChanged((unsigned)dial_nr, (unsigned)raw, (unsigned)nr_pos, button_pressed, moved_pos, moved_neg);
                     break;
                 }
@@ -146,36 +124,45 @@ void USBHIDHandler::run()
             }
         }
 
-        if (h_ != NULL) hid_close((hid_device*)h_);
+        if (h_ != NULL) {hid_close((hid_device*)h_); h_ = NULL;}
         if (onStateChanged) onStateChanged(USBHIDHandlerState::STATE_DISCONNECT);
 
-        printf("opening hidraw device\n");
-        h_ = hid_open(HID_USB_VID, HID_USB_PID, NULL);
-
-        if (h_ == NULL) {
-            perror("could not open a device");
-            if (onStateChanged) onStateChanged(USBHIDHandlerState::STATE_DISCONNECT);
-        } else {
-            wchar_t serial[200];
-            hid_get_serial_number_string((hid_device*)h_, serial, 200);
-            serial_ = wstr_to_utf8(serial);
-
-            uint8_t fw_version[HID_FIRMWARE_STRING_SZ+1];
-            fw_version[0] = HID_FEATURE_ID_3;
-            int r = hid_get_feature_report((hid_device*)h_, fw_version, sizeof(fw_version));
-            fw_version[25] = 0;
-
-            if (r) {
-                serial_ += "@";
-                serial_ += reinterpret_cast<char*>(&fw_version[1]);
-            }
-
-            if (onStateChanged) onStateChanged(USBHIDHandlerState::STATE_CONNECTED);
-        }
+        if (!run_) break;
+        printf("re-opening hidraw device\n");
+        openDevice();
 
         if (!run_) break;
         std::this_thread::sleep_for(std::chrono::seconds(1));
     }
 
     printf("terminating usb-hid loop\n");
+}
+
+bool USBHIDHandler::openDevice()
+{
+    h_ = hid_open(HID_USB_VID, HID_USB_PID, NULL);
+
+    if (h_ == NULL) {
+        perror("could not open a device\n");
+        if (onStateChanged) onStateChanged(USBHIDHandlerState::STATE_DISCONNECT);
+        return false;
+    } else {
+        wchar_t serial[200];
+        hid_get_serial_number_string((hid_device*)h_, serial, 200);
+        serial_ = wstr_to_utf8(serial);
+        printf("Successfully opened device with serial # %s\n", serial_.c_str());
+
+        uint8_t fw_version[HID_FIRMWARE_STRING_SZ+1];
+        fw_version[0] = HID_FEATURE_ID_3;
+        int r = hid_get_feature_report((hid_device*)h_, fw_version, sizeof(fw_version));
+        fw_version[25] = 0;
+
+        if (r) {
+            serial_ += "@";
+            serial_ += reinterpret_cast<char*>(&fw_version[1]);
+        }
+
+        if (onStateChanged) onStateChanged(USBHIDHandlerState::STATE_CONNECTED);
+        return true;
+    }
 }

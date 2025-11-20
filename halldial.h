@@ -1,4 +1,3 @@
-// Plain C++ replacement for the previous QObject-based HallDial
 #ifndef HALLDIAL_H
 #define HALLDIAL_H
 

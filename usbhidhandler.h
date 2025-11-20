@@ -8,7 +8,7 @@
 
 class USBHIDHandler {
 public:
-  explicit USBHIDHandler(bool boardNo = false);
+  explicit USBHIDHandler();
   ~USBHIDHandler();
 
   enum class USBHIDHandlerState { STATE_FAIL, STATE_DISCONNECT, STATE_CONNECTED };
@@ -30,6 +30,7 @@ public:
 
 private:
   void run();
+  bool openDevice();
 
   std::atomic<bool> run_;
   std::thread worker_;
