@@ -66,9 +66,7 @@ void USBHIDHandler::terminate()
 
 bool USBHIDHandler::setDialPositions( unsigned mux_setting, unsigned dial_nr,char mode, unsigned nr_positions, float zero_offset, float mag_pressed_threshold)
 {
-    hid_device *h = (hid_device *)h_;
-
-    if (h == NULL) return false;
+    if (h_ == NULL) return false;
 
     printf("configuration dial position for dial %i with %i steps and offset %f\n", dial_nr, nr_positions, zero_offset);
     uint16_t zo = zero_offset / 360.0 * HID_INPUT_NR_RAW_VALUE;
@@ -83,7 +81,7 @@ bool USBHIDHandler::setDialPositions( unsigned mux_setting, unsigned dial_nr,cha
     fr.raw_zero_offset = htobe16(zo);
     fr.mag_pressed_threshold = htobe16(mag_pressed_threshold);
 
-    int r = hid_send_feature_report((hid_device*)h, (const unsigned char*)&fr, sizeof(fr));
+    int r = hid_send_feature_report((hid_device*)h_, (const unsigned char*)&fr, sizeof(fr));
 
     return (r == sizeof(fr));
 }
